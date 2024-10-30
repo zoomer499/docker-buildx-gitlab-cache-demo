@@ -1,0 +1,156 @@
+variables:
+  TEMPLATE_VERSION: main
+  BACKEND_FOLDER: backend
+  BACKEND_FOLDER_SRC: src
+  DOTNET_VERSION: "7.0" # Примерное значение
+  DOTNET_CONFIGURATION: Release
+  DOTNET_RUNTIME: linux-musl-x64
+  BASE_BUILDER_IMAGE: ${DOCKER_REGISTRY}/ci-images/dotnet-sdk:${CONTAINER_OS}
+  BUILD_VERSION: "1.0.0"
+  BUILD_FULL_VERSION: "${BUILD_VERSION}-sha${CI_COMMIT_SHORT_SHA}"
+  CONTAINER_VERSION: "${BUILD_FULL_VERSION}"
+  GIT_SUBMODULE_STRATEGY: normal
+  GIT_SSH_COMMAND: 'ssh -o StrictHostKeyChecking=no'
+  DOCKER_REGISTRY_PROJECT: ${DOCKER_REGISTRY}/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}
+  ALPINE_IMAGE_TAG: "3.15"
+  CONTAINER_OS: ${DOTNET_VERSION}-alpine${ALPINE_IMAGE_TAG}-amd64
+  APPS_FOLDER: /apps
+  DOCKER_BUILDKIT: "1"
+  BUILD_ARTIFACTS_FOLDER: build_artifacts
+  TEMPLATES_FOLDER_NAME: .gitlab/templates/artifacts
+  NUGET_PACKAGES: ${CI_PROJECT_DIR}/${BACKEND_FOLDER}/.nuget
+  NUGET_HTTP_CACHE_PATH: /cache/.nuget
+  TXT_RED: "\e[31m"
+  TXT_GREEN: "\e[92m"
+  TXT_YELLOW: "\e[33m"
+  TXT_CYAN: "\e[36m"
+  TXT_CLEAR: "\e[0m"
+
+.templates:
+  before_script_docker_login_from_shell:
+  - docker --version
+  - docker-compose --version
+  - docker login --username $DOCKER_REGISTRY_USER --password $DOCKER_REGISTRY_PASS $DOCKER_REGISTRY
+  download_dockerignorefile:
+  - |
+    curl --output ${CONTEXT}/.dockerignore \
+         --header "PRIVATE-TOKEN: ${GITLAB_ACCESS_TOKEN}" \
+         "${CI_API_V4_URL}/projects/999/jobs/artifacts/${TEMPLATE_VERSION}/raw/${TEMPLATES_FOLDER_NAME}/.dockerignore?job=templates"
+  download_artifacts_for_build:
+  - |
+    curl --output "${CONTEXT}/Template.Dockerfile" \
+         --header "PRIVATE-TOKEN: ${GITLAB_ACCESS_TOKEN}" \
+         "${CI_API_V4_URL}/projects/999/jobs/artifacts/${TEMPLATE_VERSION}/raw/${TEMPLATES_FOLDER_NAME}/Template.Dockerfile?job=templates"
+
+  dotnet_restore:
+  - |
+      time dotnet restore ${BACKEND_FOLDER} \
+      --ignore-failed-sources \
+      --configfile ${BACKEND_FOLDER}/nuget.config \
+      --use-lock-file \
+      --runtime ${DOTNET_RUNTIME} \
+      --packages ${BACKEND_FOLDER}/.nuget ${ADDITIONAL_RESTORE_FLAGS}
+
+.templates_buildx:
+    download_buildkitd.toml:
+    - |
+      curl --output ./buildkitd.toml \
+           --header "PRIVATE-TOKEN: ${GITLAB_ACCESS_TOKEN}" \
+           "${CI_API_V4_URL}/projects/999/jobs/artifacts/${TEMPLATE_VERSION}/raw/${TEMPLATES_FOLDER_NAME}/buildkitd.toml?job=templates"
+    build:
+    - export BUILDX_BUILDER_NAME="buildx_${CI_JOB_ID}"
+    - trap "docker buildx stop $BUILDX_BUILDER_NAME; docker buildx rm $BUILDX_BUILDER_NAME -f;" INT TERM HUP QUIT
+    - !reference [.templates_buildx, download_buildkitd.toml]        
+    - docker buildx create --name=${BUILDX_BUILDER_NAME} --driver=docker-container --use --bootstrap --config ./buildkitd.toml
+    - docker buildx ls
+    - |
+        [[ -n "${DISABLE_PUSH_CONTAINER}" ]] && PUSH_FLAG="" || PUSH_FLAG="--push"
+    
+    - echo "docker buildx build ${PUSH_FLAG} --progress=plain --label company.url_project=$CI_PROJECT_URL $CACHE_STRING $ARGS_STRING $TAGS_STRING $LABELS -f ${CONTEXT}/${DOCKERFILE} ${CONTEXT}"
+    - |
+        time docker buildx build ${PUSH_FLAG} --progress=plain --label company.url_project=$CI_PROJECT_URL $CACHE_STRING $ARGS_STRING $TAGS_STRING $LABELS -f ${CONTEXT}/${DOCKERFILE} ${CONTEXT} || ( echo -e "${TXT_RED}Docker build failed. Deleting buildx builder..." && docker buildx stop $BUILDX_BUILDER_NAME && docker buildx rm $BUILDX_BUILDER_NAME -f && docker buildx rm --all-inactive -f  && echo -e "${TXT_RED}Deleted." && exit 1)
+    - docker buildx stop $BUILDX_BUILDER_NAME
+    - docker buildx rm $BUILDX_BUILDER_NAME -f
+    - docker buildx rm --all-inactive -f
+    - >
+        [[ -n "$STABLE_NOT_FOUND_STRING" ]] && echo -e "$STABLE_NOT_FOUND_STRING" && exit 1 || echo -e "$STABLE_NOT_FOUND_STRING"
+    set_strings:
+    - TAGS_STRING="-t ${DOCKER_REGISTRY_PROJECT}/${CONTAINER_NAME}:${CONTAINER_VERSION} "
+    - >
+        if [[ "$CI_COMMIT_REF_NAME" == "$CI_DEFAULT_BRANCH"  ]] ;
+        then
+            TAGS_STRING="$TAGS_STRING -t ${DOCKER_REGISTRY_PROJECT}/${CONTAINER_NAME}:latest " ;
+            TAGS_STRING="$TAGS_STRING -t ${DOCKER_REGISTRY_PROJECT}/${CONTAINER_NAME}:${BUILD_VERSION} " ;
+        fi ; 
+        if [[ -n "$CI_COMMIT_TAG" && "${IS_API_TEST}" != "true" ]] ;
+        then
+            TAGS_STRING="$TAGS_STRING -t ${DOCKER_REGISTRY_PROJECT}/${CONTAINER_NAME}:release-${CI_COMMIT_TAG} " ;
+            TRIM_STRING="-p:PublishTrimmed=false"
+        fi
+    - >
+        for ADD_TAG in $ADDITIONAL_TAGS ;
+        do
+            TAGS_STRING="$TAGS_STRING -t ${DOCKER_REGISTRY_PROJECT}/${CONTAINER_NAME}:${ADD_TAG} " ;
+        done
+    - ARGS_STRING=""
+    - |
+        if [[ "${IS_API_TEST}" == "true" ]] ; then  \
+            sed -i '/USER \$UID/,+10d' ${CONTEXT}/Template.Dockerfile ; \
+            if [[ "IS_API_TEST_USER_SAVE" ]] ; then echo 'USER $UID' >> ${CONTEXT}/Template.Dockerfile ; fi; \
+            echo 'ENTRYPOINT ["/bin/sh", "-c" ] \
+        CMD ["exec dotnet test '${DOTNET_ASSEMBLY_PREFIX}${PROJECT_FOLDER}'.dll --logger \"junit;MethodFormat=Class;FailureBodyFormat=Verbose;LogFilePath=${API_TESTS_RESULTS}\" ${API_TEST_ADDITIONAL_FLAGS} && exit 0 || exit 1"]' >> ${CONTEXT}/Template.Dockerfile ; \
+            BASE_IMAGE=${BASE_TEST_IMAGE} ; \
+            BASE_IMAGE_TAG=${CONTAINER_OS} ; \
+        fi
+    - >
+        for ADD_ARG in $ARGS_FROM_VARIABLES ;
+        do
+            if [[ -n "$ADD_ARG" ]] ;
+            then
+                ARGS_STRING="$ARGS_STRING --build-arg $ADD_ARG=${!ADD_ARG} " ;
+            fi ;
+        done
+    - >
+        for ADD_ARG in $ADDITIONAL_ARGS ;
+        do
+            ARGS_STRING="$ARGS_STRING --build-arg $ADD_ARG " ;
+        done
+    - >
+      if [[ -z "$CI_COMMIT_BRANCH" ]]; then
+        CI_COMMIT_BRANCH=""
+      fi
+      
+      if [[ -z "$CI_COMMIT_TAG" ]]; then
+        CI_COMMIT_TAG=""
+      fi
+      
+      if [[ "$CI_COMMIT_BRANCH" =~ ^release/.* ]] || [ -n "$CI_COMMIT_TAG" ]; then
+        CACHE_STRING="--no-cache"
+      elif [[ "$CI_COMMIT_REF_NAME" == "$CI_DEFAULT_BRANCH" && "$ENABLE_DOCKER_CACHE" == "true" ]]; then
+        if [[ -z "$DOCKER_REGISTRY" || -z "$CONTAINER_NAME" ]]; then
+          CACHE_STRING="--no-cache"
+        else
+          CACHE_STRING="--cache-to type=registry,ref=${DOCKER_REGISTRY}/cache/${CONTAINER_NAME}:cache,mode=${DOCKER_CACHE_TO_MODE},image-manifest=true --cache-from type=registry,ref=${DOCKER_REGISTRY}/cache/${CONTAINER_NAME}:cache"
+        fi
+      else
+        if [[ -z "$DOCKER_REGISTRY" || -z "$CONTAINER_NAME" ]]; then
+          CACHE_STRING="--no-cache"
+        else
+          CACHE_STRING="--cache-from type=registry,ref=${DOCKER_REGISTRY}/cache/${CONTAINER_NAME}:cache"
+        fi
+      fi
+    - LABELS="--label company.git.commit=${CI_COMMIT_SHORT_SHA} --label company.git.branch=${CI_COMMIT_REF_SLUG} --label company.build.version=${CONTAINER_VERSION} --label company.build.date=$(date -u +'%Y-%m-%dT%H:%M:%SZ') ${CONTAINER_LABEL:+--label} ${CONTAINER_LABEL}"
+
+    repush:
+        - |
+            if [[ "$TAGS_STRING" =~ ":stable" && "$SKIP_REPUSH" != "true" ]] ;
+                then
+                    DOCKER_REGISTRY_PROJECT_PART=$(echo "${DOCKER_REGISTRY_PROJECT}" | cut -d"/" -f2) \
+                    && echo "https://harbor/api/v2.0/projects/${DOCKER_REGISTRY_PROJECT_PART}/repositories/${DOCKER_SKOPEO_REPUSH_PATH_PART}${CONTAINER_NAME}/artifacts/stable/tags?page=1" \
+                    && curl --fail "https://harbor/api/v2.0/projects/${DOCKER_REGISTRY_PROJECT_PART}/repositories/${DOCKER_SKOPEO_REPUSH_PATH_PART}${CONTAINER_NAME}/artifacts/stable/tags?page=1" \
+                    && skopeo --insecure-policy copy docker://$DOCKER_REGISTRY_PROJECT/${CONTAINER_NAME}:stable docker://$DOCKER_REGISTRY_PROJECT/${CONTAINER_NAME}:prev \
+                    --debug --src-creds $DOCKER_REGISTRY_USER:$DOCKER_REGISTRY_PASS --dest-creds $DOCKER_REGISTRY_USER:$DOCKER_REGISTRY_PASS \
+                    || STABLE_NOT_FOUND_STRING="${TXT_YELLOW}###\n#\n#  ВНИМАНИЕ!!!\n#\n###\n\n Container with tag :stable not found, !!! PLS RETRY PIPELINE${TXT_CLEAR}" ;
+            fi
+    
+    

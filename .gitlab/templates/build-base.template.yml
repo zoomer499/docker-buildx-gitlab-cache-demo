@@ -1,0 +1,31 @@
+#
+# Пример шаблона build
+#
+
+.build from dockerfile:
+    retry: 1
+    stage: build
+    tags:
+        - build
+    variables:
+        BUILDX_BUILDER_NAME: container${CI_JOB_ID}
+        ARGS_FROM_VARIABLES: "ADDITIONAL_BUILD_FLAGS ADDITIONAL_RESTORE_FLAGS ALPINE_IMAGE_TAG APPS_FOLDER BACKEND_FOLDER BACKEND_FOLDER_SRC BASE_BUILDER_IMAGE BASE_IMAGE BASE_IMAGE_TAG BUILD_ADDITIONAL_PACKAGES BUILD_ARTIFACTS_FOLDER BUILD_VERSION CI_COMMIT_REF_PROTECTED CONTAINER_OS CONTAINER_VERSION DOCKER_REGISTRY DOTNET_CONFIGURATION DOTNET_RUNTIME DOTNET_VERSION FILE_FOLDERS TREAT_WARNINGS_AS_ERRORS_FLAG MAX_BUILD_CPU_COUNT PROJECT_FOLDER REWRITE_ENTRYPOINT TRIM_STRING NUGET_XMLDOC_MODE CSPROJ_FILE_NAME"
+        STABLE_TAG: stable
+        ADDITIONAL_TAGS: ""
+        ADDITIONAL_ARGS: "BUILDKIT_INLINE_CACHE=1"
+        ENABLE_DOCKER_CACHE: "true"
+        DOCKER_CACHE_TO_MODE: "min"
+        DOCKERFILE: Dockerfile
+        # Use those variables:
+        CONTAINER_NAME: "You_forgot_to_set_CONTAINER_NAME_variable"
+        CONTEXT: You_forgot_to_set_CONTEXT_variable
+        BASE_TEST_IMAGE: ${DOCKER_REGISTRY}/ci-docker-images/dotnet-sdk-gitlab-runner
+    dependencies: []
+    script:
+        - !reference [.templates, before_script_docker_login_from_shell]
+        - !reference [.templates_buildx, set_strings]
+        - !reference [.templates_buildx, repush]
+        - !reference [.templates_buildx, build]
+        
+    
+

@@ -1,0 +1,25 @@
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - when: always
+
+variables:
+  BUILD_VERSION: "1.0.0" # Укажите версию сборки
+  DOTNET_RUNTIME: linux-musl-x64 # Платформа для .NET
+  DOTNET_VERSION: "7.0" # Версия .NET (замените на нужную версию)
+  CHART_FOLDER: .helm/example-chart # Папка для Helm чарта
+  BACKEND_FOLDER: backend # Папка для бэкенда
+  BACKEND_FOLDER_SRC: src # Исходники бэкенда
+  FRONTEND_FOLDER: frontend # Папка для фронтенда
+  DOTNET_CONFIGURATION: Release # Конфигурация .NET сборки
+
+include:
+  - project: 'example-organization/service-template' # Замените на реальный проект-шаблон
+    ref: main # Укажите актуальную ветку или тег
+    file: 
+      - '.gitlab/templates/common.template.yml'
+      - '.gitlab/templates/build-base.template.yml'
+
+stages:
+  - build
